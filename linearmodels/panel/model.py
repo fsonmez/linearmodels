@@ -870,14 +870,37 @@ class PanelOLS(PooledOLS):
         mod.formula = formula
         return mod
 
-    def _slow_path(self):
+    def _drop_singletons(self, drop_singletons):
+        y = self.dependent.values2d
+        x = self.exog.values2d
+        w = self.weights.values2d
+        has_effects = self._time_effects or self._entity_effects or self._other_effects
+        if not drop_singletons or not has_effects:
+            return y, x, w
+        effects = []
+        if self._time_effects:
+            effects.append(self.dependent.time_ids)
+        if self._entity_effects:
+            effects.append(self.dependent.entity_ids)
+        if self._other_effects:
+            effects.append(self._other_effect_cats)
+        effects = pd.concat(effects, 1)
+        index = effects.set_index(list(effects.columns)).index
+        index = index.to_series()
+        vc = index.value_counts()
+        drop = vc == 5
+        retain = ~(index.isin(vc[drop].index).values)
+        # TODO: Check there are enough observtions?
+        return tuple(v[retain] for v in (y,x,w))
+
+    def _slow_path(self, drop_singletons):
         """Frisch-Waugh-Lovell implementation, works for all scenarios"""
         has_effect = self.entity_effects or self.time_effects or self.other_effects
-        w = self.weights.values2d
-        root_w = np.sqrt(w)
+        y, x, w = self._drop_singletons(drop_singletons)
 
-        y = root_w * self.dependent.values2d
-        x = root_w * self.exog.values2d
+        root_w = np.sqrt(w)
+        y = root_w * y
+        x = root_w * x
         if not has_effect:
             ybar = root_w @ lstsq(root_w, y)[0]
             return y, x, ybar, 0, 0
@@ -936,11 +959,10 @@ class PanelOLS(PooledOLS):
                           'the number of entities or number of time periods.', MemoryWarning)
         return low_memory
 
-    def _fast_path(self, low_memory):
+    def _fast_path(self, low_memory, drop_singletons):
         """Dummy-variable free estimation without weights"""
         has_effect = self.entity_effects or self.time_effects or self.other_effects
-        y = self.dependent.values2d
-        x = self.exog.values2d
+        y, x, w = self._drop_singletons(drop_singletons)
         ybar = y.mean(0)
 
         if not has_effect:
@@ -985,12 +1007,10 @@ class PanelOLS(PooledOLS):
 
         return y, x, ybar
 
-    def _weighted_fast_path(self, low_memory):
+    def _weighted_fast_path(self, low_memory, drop_singletons):
         """Dummy-variable free estimation with weights"""
         has_effect = self.entity_effects or self.time_effects or self.other_effects
-        y = self.dependent.values2d
-        x = self.exog.values2d
-        w = self.weights.values2d
+        y, x, w = self._drop_singletons(drop_singletons)
         root_w = np.sqrt(w)
         wybar = root_w * (w.T @ y / w.sum())
 
@@ -1098,13 +1118,16 @@ class PanelOLS(PooledOLS):
             return not self._is_effect_nested(effects, clusters)
         return True  # Default case for 2-way -- not completely clear
 
-    def fit(self, *, use_lsdv=False, low_memory=None, cov_type='unadjusted', debiased=True,
-            auto_df=True, count_effects=True, **cov_config):
+    def fit(self, *, drop_singletons=False, use_lsdv=False, low_memory=None, cov_type='unadjusted',
+            debiased=True, auto_df=True, count_effects=True, **cov_config):
         """
         Estimate model parameters
 
         Parameters
         ----------
+        drop_singletons : bool, optional
+            Flag indicating whether singletons observations are dropped
+            parameters are estimated.
         use_lsdv : bool, optional
             Flag indicating to use the Least Squares Dummy Variable estimator
             to eliminate effects.  The default value uses only means and does
@@ -1173,11 +1196,11 @@ class PanelOLS(PooledOLS):
         y_effects = x_effects = 0
         low_memory = self._choose_twoway_algo() if low_memory is None else low_memory
         if use_lsdv:
-            y, x, ybar, y_effects, x_effects = self._slow_path()
+            y, x, ybar, y_effects, x_effects = self._slow_path(drop_singletons)
         elif not weighted:
-            y, x, ybar = self._fast_path(low_memory=low_memory)
+            y, x, ybar = self._fast_path(low_memory, drop_singletons)
         else:
-            y, x, ybar, y_effects, x_effects = self._weighted_fast_path(low_memory=low_memory)
+            y, x, ybar, y_effects, x_effects = self._weighted_fast_path(low_memory, drop_singletons)
 
         neffects = 0
         drop_first = self.has_constant
